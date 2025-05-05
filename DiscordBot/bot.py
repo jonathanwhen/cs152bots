@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import requests
-from report import Report
+from report import Report, State, ReportReason
 import pdb
 
 # Set up logging to the console
@@ -25,7 +25,6 @@ with open(token_path) as f:
     tokens = json.load(f)
     discord_token = tokens['discord']
 
-
 class ModBot(discord.Client):
     def __init__(self): 
         intents = discord.Intents.default()
@@ -34,6 +33,7 @@ class ModBot(discord.Client):
         self.group_num = None
         self.mod_channels = {} # Map from guild to the mod channel id for that guild
         self.reports = {} # Map from user IDs to the state of their report
+        self.mod_reports = {} # Map from mod message IDs to reported message info
 
     async def on_ready(self):
         print(f'{self.user.name} has connected to Discord! It is these guilds:')
@@ -81,27 +81,116 @@ class ModBot(discord.Client):
         author_id = message.author.id
         responses = []
 
-        # Only respond to messages if they're part of a reporting flow
-        if author_id not in self.reports and not message.content.startswith(Report.START_KEYWORD):
+        # Only respond to messages if they're part of a reporting flow or starting one
+        if message.content.lower() == Report.START_KEYWORD:
+            self.reports[author_id] = Report(self)
+        elif author_id not in self.reports:
             return
 
-        # If we don't currently have an active report for this user, add one
-        if author_id not in self.reports:
-            self.reports[author_id] = Report(self)
-
-        # Let the report class handle this message; forward all the messages it returns to uss
+        # Let the report class handle this message; forward all the messages it returns to us
         responses = await self.reports[author_id].handle_message(message)
         for r in responses:
             await message.channel.send(r)
+
+        # Forward report events to mod channels when complete
+        if author_id in self.reports and self.reports[author_id].state == State.REPORT_COMPLETE and self.reports[author_id].reason:
+            # Find the guild that contains the reported message
+            guild_id = self.reports[author_id].message.guild.id
+            if guild_id in self.mod_channels:
+                report = self.reports[author_id]
+                reason_text = report.reason.value
+                if report.reason == ReportReason.HATE_SPEECH and report.hate_speech_type:
+                    reason_text += f" - {report.hate_speech_type.value}"
+                
+                mod_message = await self.mod_channels[guild_id].send(
+                    f'New report from {message.author.name} via DM:\n'
+                    f'Reason: {reason_text}\n'
+                    f'Message: {report.message.author.name}: "{report.message.content}"\n'
+                    f'\nModerators can reply with "Ban" or "Warn" to take action.'
+                )
+                
+                # Store the report information
+                self.mod_reports[mod_message.id] = {
+                    'reported_message': report.message,
+                    'reporter': message.author,
+                    'reason': reason_text
+                }
 
         # If the report is complete or cancelled, remove it from our map
         if self.reports[author_id].report_complete():
             self.reports.pop(author_id)
 
     async def handle_channel_message(self, message):
+        # Check if this is a mod response to a report
+        if message.channel.name == f'group-{self.group_num}-mod' and message.reference:
+            referenced_message = await message.channel.fetch_message(message.reference.message_id)
+            if referenced_message.id in self.mod_reports:
+                action = message.content.lower()
+                reported_info = self.mod_reports[referenced_message.id]
+                reported_user = reported_info['reported_message'].author
+                
+                if action == "ban":
+                    try:
+                        # Instead of banning, just send a DM
+                        await reported_user.send(f"⛔ You have been banned for: {reported_info['reason']}")
+                        await message.channel.send(f"✅ Simulated ban message sent to {reported_user.name}.")
+                        if isinstance(reported_info['reporter'], discord.Member):
+                            await reported_info['reporter'].send(f"The user you reported has been banned. Thank you for helping keep our community safe!")
+                    except discord.Forbidden:
+                        await message.channel.send("❌ I couldn't send a message to that user (they may have DMs disabled).")
+                    
+                elif action == "warn":
+                    try:
+                        await reported_user.send(f"⚠️ You have received a warning for: {reported_info['reason']}. If this happens again you will be banned.")
+                        await message.channel.send(f"✅ Warning sent to {reported_user.name}.")
+                        if isinstance(reported_info['reporter'], discord.Member):
+                            await reported_info['reporter'].send(f"The user you reported has been warned. Thank you for helping keep our community safe!")
+                    except discord.Forbidden:
+                        await message.channel.send("❌ I couldn't send a warning to that user (they may have DMs disabled).")
+                return
+
         # Only handle messages sent in the "group-#" channel
         if not message.channel.name == f'group-{self.group_num}':
             return
+
+        # Check if this is a "report" reply to another message
+        if message.reference and message.content.lower() == Report.START_KEYWORD:
+            try:
+                referenced_message = await message.channel.fetch_message(message.reference.message_id)
+                # Start a report flow with the referenced message
+                self.reports[message.author.id] = Report(self, referenced_message)
+                responses = await self.reports[message.author.id].handle_message(message)
+                for r in responses:
+                    await message.channel.send(r)
+                
+                # If the report is complete and has a reason, forward to mod channel
+                report = self.reports[message.author.id]
+                if report.state == State.REPORT_COMPLETE and report.reason:
+                    reason_text = report.reason.value
+                    if report.reason == ReportReason.HATE_SPEECH and report.hate_speech_type:
+                        reason_text += f" - {report.hate_speech_type.value}"
+                    
+                    mod_message = await self.mod_channels[message.guild.id].send(
+                        f'New report from {message.author.name} via reply:\n'
+                        f'Reason: {reason_text}\n'
+                        f'Message: {report.message.author.name}: "{report.message.content}"\n'
+                        f'\nModerators can reply with "Ban" or "Warn" to take action.'
+                    )
+                    
+                    # Store the report information
+                    self.mod_reports[mod_message.id] = {
+                        'reported_message': report.message,
+                        'reporter': message.author,
+                        'reason': reason_text
+                    }
+                
+                # If the report is complete, remove it from our map
+                if report.report_complete():
+                    self.reports.pop(message.author.id)
+                return
+            except discord.errors.NotFound:
+                await message.channel.send("I couldn't find the message you're trying to report. It may have been deleted.")
+                return
 
         # Forward the message to the mod channel
         mod_channel = self.mod_channels[message.guild.id]
