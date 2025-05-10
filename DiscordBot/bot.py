@@ -166,45 +166,6 @@ class ModBot(discord.Client):
         if not message.channel.name == f'group-{self.group_num}':
             return
 
-        # Check if this is a "report" reply to another message
-        if message.reference and message.content.lower() == Report.START_KEYWORD:
-            try:
-                referenced_message = await message.channel.fetch_message(message.reference.message_id)
-                # Start a report flow with the referenced message
-                self.reports[message.author.id] = Report(self, referenced_message)
-                responses = await self.reports[message.author.id].handle_message(message)
-                for r in responses:
-                    await message.channel.send(r)
-                
-                # If the report is complete and has a reason, forward to mod channel
-                report = self.reports[message.author.id]
-                if report.state == State.REPORT_COMPLETE and report.reason:
-                    reason_text = report.reason.value
-                    if report.reason == ReportReason.HATE_SPEECH and report.hate_speech_type:
-                        reason_text += f" - {report.hate_speech_type.value}"
-                    
-                    mod_message = await self.mod_channels[message.guild.id].send(
-                        f'New report from {message.author.name} via reply:\n'
-                        f'Reason: {reason_text}\n'
-                        f'Message: {report.message.author.name}: "{report.message.content}"\n'
-                        f'\nModerators can reply with "Ban" or "Warn" to take action.'
-                    )
-                    
-                    # Store the report information
-                    self.mod_reports[mod_message.id] = {
-                        'reported_message': report.message,
-                        'reporter': message.author,
-                        'reason': reason_text
-                    }
-                
-                # If the report is complete, remove it from our map
-                if report.report_complete():
-                    self.reports.pop(message.author.id)
-                return
-            except discord.errors.NotFound:
-                await message.channel.send("I couldn't find the message you're trying to report. It may have been deleted.")
-                return
-
         # Forward the message to the mod channel
         mod_channel = self.mod_channels[message.guild.id]
         await mod_channel.send(f'Forwarded message:\n{message.author.name}: "{message.content}"')
