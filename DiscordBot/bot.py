@@ -31,9 +31,10 @@ class ModBot(discord.Client):
         intents.message_content = True
         super().__init__(command_prefix='.', intents=intents)
         self.group_num = None
-        self.mod_channels = {} # Map from guild to the mod channel id for that guild
-        self.reports = {} # Map from user IDs to the state of their report
-        self.mod_reports = {} # Map from mod message IDs to reported message info
+        self.mod_channels = {}  # Map from guild to the mod channel id for that guild
+        self.reports = {}  # Map from user IDs to the state of their report
+        self.mod_reports = {}  # Map from mod message IDs to reported message info
+        self.message_report_counts = {}  # Map from message IDs to the number of times they've been reported
 
     async def on_ready(self):
         print(f'{self.user.name} has connected to Discord! It is these guilds:')
@@ -98,14 +99,23 @@ class ModBot(discord.Client):
             guild_id = self.reports[author_id].message.guild.id
             if guild_id in self.mod_channels:
                 report = self.reports[author_id]
+                reported_message_id = report.message.id
+        
+                # Update the report count for this message
+                if reported_message_id not in self.message_report_counts:
+                    self.message_report_counts[reported_message_id] = 1
+                else:
+                    self.message_report_counts[reported_message_id] += 1
+
                 reason_text = report.reason.value
                 if report.reason == ReportReason.HATE_SPEECH and report.hate_speech_type:
                     reason_text += f" - {report.hate_speech_type.value}"
-                
+
                 mod_message = await self.mod_channels[guild_id].send(
                     f'New report from {message.author.name} via DM:\n'
                     f'Reason: {reason_text}\n'
                     f'Message: {report.message.author.name}: "{report.message.content}"\n'
+                    f'This message has been reported {self.message_report_counts[reported_message_id]} time(s).\n'
                     f'\nModerators can reply with "Ban" or "Warn" to take action.'
                 )
                 
@@ -113,11 +123,12 @@ class ModBot(discord.Client):
                 self.mod_reports[mod_message.id] = {
                     'reported_message': report.message,
                     'reporter': message.author,
-                    'reason': reason_text
+                    'reason': reason_text,
+                    'report_count': self.message_report_counts[reported_message_id]
                 }
 
         # If the report is complete or cancelled, remove it from our map
-        if self.reports[author_id].report_complete():
+        if author_id in self.reports and self.reports[author_id].report_complete():
             self.reports.pop(author_id)
 
     async def handle_channel_message(self, message):
@@ -133,6 +144,7 @@ class ModBot(discord.Client):
                     try:
                         # Instead of banning, just send a DM
                         await reported_user.send(f"⛔ You have been banned for: {reported_info['reason']}")
+                        await reported_info['reported_message'].delete()
                         await message.channel.send(f"✅ Simulated ban message sent to {reported_user.name}.")
                         if isinstance(reported_info['reporter'], discord.Member):
                             await reported_info['reporter'].send(f"The user you reported has been banned. Thank you for helping keep our community safe!")
@@ -142,6 +154,7 @@ class ModBot(discord.Client):
                 elif action == "warn":
                     try:
                         await reported_user.send(f"⚠️ You have received a warning for: {reported_info['reason']}. If this happens again you will be banned.")
+                        await reported_info['reported_message'].delete()
                         await message.channel.send(f"✅ Warning sent to {reported_user.name}.")
                         if isinstance(reported_info['reporter'], discord.Member):
                             await reported_info['reporter'].send(f"The user you reported has been warned. Thank you for helping keep our community safe!")
