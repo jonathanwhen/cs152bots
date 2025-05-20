@@ -1,2 +1,3 @@
 # AI primarily used for help with documentation, formatting, and in-line comments. Some debugging/intermediate fallback error logic help was also taken.
 # Some prompting of AI for things like this README and user prompting (e.g. report message prompting) also used some AI assistance.
+# The evaluation part was also partially AI-assisted
