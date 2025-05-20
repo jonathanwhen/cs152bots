@@ -1,6 +1,8 @@
 from enum import Enum, auto
 import discord
 import re
+import openai
+import os
 
 class State(Enum):
     REPORT_START = auto()
@@ -9,6 +11,7 @@ class State(Enum):
     AWAITING_REASON = auto()
     AWAITING_HATE_SPEECH_TYPE = auto()
     REPORT_COMPLETE = auto()
+    AWAITING_CONFIRMATION = auto()
 
 class ReportReason(Enum):
     HATE_SPEECH = "hate speech"
@@ -24,6 +27,62 @@ class HateSpeechType(Enum):
     DISCRIMINATION = "discrimination"
     DISCRIMINATORY_STEREOTYPES = "discriminatory stereotypes"
 
+class HateSpeechClassifier:
+    def __init__(self):
+        # Initialize with your API key - ideally from environment variables for security
+        openai.api_key = os.environ.get("OPENAI_API_KEY")
+    
+    async def classify_message(self, message_content):
+        """
+        Uses LLM to classify if a message contains hate speech and what type.
+        Returns a tuple (is_hate_speech, hate_speech_type, confidence, explanation)
+        """
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",  # Or use another appropriate model
+                messages=[
+                    {"role": "system", "content": "You are an AI trained to detect and classify hate speech in messages."},
+                    {"role": "user", "content": f"Analyze this message for hate speech: '{message_content}'. If it contains hate speech, specify the type (hateful references, slurs, hateful symbols/signs, discrimination, or discriminatory stereotypes) and provide a brief explanation. Format your response as: CONTAINS_HATE_SPEECH: [Yes/No], TYPE: [type if applicable], CONFIDENCE: [High/Medium/Low], EXPLANATION: [brief explanation]"}
+                ]
+            )
+            
+            result = response.choices[0].message.content
+            
+            # Parse the structured response
+            contains_hate = "CONTAINS_HATE_SPEECH: Yes" in result
+            
+            if contains_hate:
+                # Extract type
+                type_match = re.search(r"TYPE: (.*?)(?:,|$)", result)
+                hate_type = type_match.group(1) if type_match else "unknown"
+                
+                # Extract confidence
+                confidence_match = re.search(r"CONFIDENCE: (.*?)(?:,|$)", result)
+                confidence = confidence_match.group(1) if confidence_match else "Medium"
+                
+                # Extract explanation
+                explanation_match = re.search(r"EXPLANATION: (.*?)(?:$)", result)
+                explanation = explanation_match.group(1) if explanation_match else ""
+                
+                # Map to HateSpeechType
+                mapped_type = None
+                for hs_type in HateSpeechType:
+                    if hs_type.value.lower() in hate_type.lower():
+                        mapped_type = hs_type
+                        break
+                
+                if not mapped_type:
+                    # Default to the closest match or first type
+                    mapped_type = HateSpeechType.DISCRIMINATION
+                
+                return (contains_hate, mapped_type, confidence, explanation)
+            else:
+                return (False, None, "High", "No hate speech detected")
+                
+        except Exception as e:
+            print(f"Error using LLM for classification: {str(e)}")
+            return (False, None, "Low", f"Error during analysis: {str(e)}")
+
 class Report:
     START_KEYWORD = "report"
     CANCEL_KEYWORD = "cancel"
@@ -35,6 +94,8 @@ class Report:
         self.message = reference_message
         self.reason = None
         self.hate_speech_type = None
+        self.llm_classifier = HateSpeechClassifier()
+        self.llm_analysis_result = None
     
     async def handle_message(self, message):
         '''
@@ -46,6 +107,9 @@ class Report:
         if message.content == self.CANCEL_KEYWORD:
             self.state = State.REPORT_COMPLETE
             return ["Report cancelled."]
+        
+        if message.content == self.HELP_KEYWORD:
+            return ["This is the reporting system. Follow the prompts to report a message. You can say `cancel` at any time to cancel the report."]
         
         if self.state == State.REPORT_START:
             reply =  "Thank you for starting the reporting process. "
@@ -73,14 +137,57 @@ class Report:
             self.state = State.MESSAGE_IDENTIFIED
 
         if self.state == State.MESSAGE_IDENTIFIED:
-            # If we have a message (either from reference or link), show it and ask for reason
+            # If we have a message (either from reference or link), analyze it with LLM
             if self.message:
+                # Analyze message content with LLM
+                is_hate, hate_type, confidence, explanation = await self.llm_classifier.classify_message(self.message.content)
+                self.llm_analysis_result = (is_hate, hate_type, confidence, explanation)
+                
+                # If hate speech was detected with high confidence
+                if is_hate and confidence.lower() == "high":
+                    self.reason = ReportReason.HATE_SPEECH
+                    self.hate_speech_type = hate_type
+                    self.state = State.AWAITING_CONFIRMATION
+                    
+                    return [
+                        "I found this message:", 
+                        "```" + self.message.author.name + ": " + self.message.content + "```",
+                        f"Our AI analysis detected this as hate speech of type: {hate_type.value}",
+                        f"Explanation: {explanation}",
+                        "Is this correct? Please respond with 'yes' to confirm or 'no' to manually classify."
+                    ]
+                else:
+                    # Proceed with normal flow if no hate speech detected or low confidence
+                    self.state = State.AWAITING_REASON
+                    reply = ["I found this message:", "```" + self.message.author.name + ": " + self.message.content + "```"]
+                    
+                    if is_hate:
+                        reply.append(f"Our AI suggests this might contain {hate_type.value} (confidence: {confidence})")
+                        reply.append(f"AI explanation: {explanation}")
+                    
+                    reply.extend([
+                        "What is the reason for reporting this message? Please choose one of the following:", 
+                        "1. hate speech", "2. spam", "3. violent and/or hateful entities", "4. violent speech", "5. other",
+                        "\nPlease respond with the number or the exact text of your choice."
+                    ])
+                    return reply
+        
+        if self.state == State.AWAITING_CONFIRMATION:
+            if message.content.lower() == 'yes':
+                self.state = State.REPORT_COMPLETE
+                return [
+                    f"Thank you for your report. The message has been reported for: {self.reason.value} - {self.hate_speech_type.value}",
+                    "Thank you for your report and we appreciate you helping to make our platform better and safer! We will thoroughly investigate your report shortly. In the meantime, please consider muting or blocking the reported account."
+                ]
+            elif message.content.lower() == 'no':
                 self.state = State.AWAITING_REASON
-                reply = ["I found this message:", "```" + self.message.author.name + ": " + self.message.content + "```", \
-                        "What is the reason for reporting this message? Please choose one of the following:", \
-                        "1. hate speech", "2. spam", "3. violent and/or hateful entities", "4. violent speech", "5. other", \
-                        "\nPlease respond with the number or the exact text of your choice."]
-                return reply
+                return [
+                    "What is the reason for reporting this message? Please choose one of the following:", 
+                    "1. hate speech", "2. spam", "3. violent and/or hateful entities", "4. violent speech", "5. other",
+                    "\nPlease respond with the number or the exact text of your choice."
+                ]
+            else:
+                return ["Please respond with 'yes' to confirm or 'no' to manually classify."]
         
         if self.state == State.AWAITING_REASON:
             # Accept either the number or the text of the reason
@@ -128,7 +235,7 @@ class Report:
             self.state = State.REPORT_COMPLETE
             return [
                 f"Thank you for your report. The message has been reported for {self.reason.value} - {self.hate_speech_type.value}",
-                "Thank you for your report and we appreciate you helping to make our platofrm better and safer! We will thoroughly investigate your report shortly. In the meantime, please consider muting or blocking the reported account."
+                "Thank you for your report and we appreciate you helping to make our platform better and safer! We will thoroughly investigate your report shortly. In the meantime, please consider muting or blocking the reported account."
             ]
 
         return []
