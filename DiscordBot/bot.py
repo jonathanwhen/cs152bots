@@ -163,25 +163,58 @@ class ModBot(discord.Client):
                     reason_text += f" - {report.hate_speech_type.value}"
 
                 # Send report to moderators
-                mod_message = await self.mod_channels[guild_id].send(
-                    f'New report from {message.author.name} via DM:\n'
-                    f'Reason: {reason_text}\n'
-                    f'Message: {report.message.author.name}: "{report.message.content}"\n'
-                    f'This message has been reported {self.message_report_counts[reported_message_id]} time(s).\n'
-                    f'\nModerators can reply with "Ban" or "Warn" to take action.'
+                await self.send_actionable_report_to_mods(
+                    guild_id, 
+                    report.message, 
+                    message.author,
+                    reason_text,
+                    self.message_report_counts[reported_message_id],
+                    is_user_report=True
                 )
-                
-                # Store report info for later reference
-                self.mod_reports[mod_message.id] = {
-                    'reported_message': report.message,
-                    'reporter': message.author,
-                    'reason': reason_text,
-                    'report_count': self.message_report_counts[reported_message_id]
-                }
 
         # Clean up completed reports
         if author_id in self.reports and self.reports[author_id].report_complete():
             self.reports.pop(author_id)
+
+    async def send_actionable_report_to_mods(self, guild_id, reported_message, reporter, reason, report_count=1, is_user_report=True):
+        """
+        Sends an actionable report to the mod channel and stores the report info.
+        
+        Args:
+            guild_id: ID of the guild/server
+            reported_message: The message being reported
+            reporter: User who reported the message or "AutoMod" for automatic detection
+            reason: Reason for the report
+            report_count: Number of times this message has been reported
+            is_user_report: Whether this is a user report (True) or automatic detection (False)
+        """
+        if guild_id in self.mod_channels:
+            # Format reporter information based on source
+            if is_user_report:
+                reporter_text = f"from {reporter.name} via DM"
+            else:
+                reporter_text = "from automatic detection"
+                
+            # Send the report to the mod channel
+            mod_message = await self.mod_channels[guild_id].send(
+                f'New report {reporter_text}:\n'
+                f'Reason: {reason}\n'
+                f'Message: {reported_message.author.name}: "{reported_message.content}"\n'
+                f'This message has been reported {report_count} time(s).\n'
+                f'\nModerators can reply with "Ban" or "Warn" to take action.'
+            )
+            
+            # Store the report info for later reference
+            self.mod_reports[mod_message.id] = {
+                'reported_message': reported_message,
+                'reporter': reporter,
+                'reason': reason,
+                'report_count': report_count,
+                'is_user_report': is_user_report
+            }
+            
+            return mod_message
+        return None
 
     async def handle_channel_message(self, message):
         """
@@ -249,9 +282,22 @@ class ModBot(discord.Client):
                 await mod_channel.send(f'Forwarded message:\n{message.author.name}: "{message.content}"')
                 await mod_channel.send(self.code_format(scores))
             
-            # Update user offense count if hate speech was detected
+            # Update user offense count and create actionable report if hate speech was detected
             if msg_has_hate:
                 await self.update_user_offense_count(message.author, mod_channel)
+                
+                # Create an actionable report for moderators
+                reason_text = f"Automatic hate speech detection"
+                if scores.get("category"):
+                    reason_text += f" - {scores.get('category')}"
+                
+                await self.send_actionable_report_to_mods(
+                    message.guild.id,
+                    message,
+                    "AutoMod",
+                    reason_text,
+                    is_user_report=False
+                )
         
         # Process any attached text files
         for attachment in message.attachments:
@@ -277,9 +323,22 @@ class ModBot(discord.Client):
                             preview = file_text[:500] + "...(truncated)"
                             await mod_channel.send(f'File content preview (truncated):\n```\n{preview}\n```')
                     
-                    # Update user offense count if hate speech was detected
+                    # Update user offense count and create actionable report if hate speech was detected
                     if file_has_hate:
                         await self.update_user_offense_count(message.author, mod_channel)
+                        
+                        # Create an actionable report for moderators for file content
+                        reason_text = f"Automatic hate speech detection in file ({attachment.filename})"
+                        if file_scores.get("category"):
+                            reason_text += f" - {file_scores.get('category')}"
+                        
+                        await self.send_actionable_report_to_mods(
+                            message.guild.id,
+                            message,
+                            "AutoMod", 
+                            reason_text,
+                            is_user_report=False
+                        )
                         
                 elif self.forward_clean_messages:
                     await mod_channel.send(f'⚠️ Could not read text from {attachment.filename}')
