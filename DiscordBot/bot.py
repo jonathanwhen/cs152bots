@@ -37,7 +37,7 @@ with open(token_path) as f:
         print("Add an 'openai' field with your API key to enable hate speech detection")
         openai.api_key = None
 
-class ModBot(discord.Client):
+class ModBot(commands.Bot):
     """
     Discord bot for content moderation with hate speech detection capabilities.
     Handles message reporting, automated content analysis, and moderation actions.
@@ -59,6 +59,10 @@ class ModBot(discord.Client):
         self.escalated_reports = {}
         self.escalation_channel_id = None
         self.law_enforcement_reports = {}  # Track LE escalations with reference IDs
+    
+    async def setup_hook(self):
+        """Load in moderator flow"""
+        await self.load_extension('moderation')
 
     async def on_ready(self):
         """
@@ -168,7 +172,8 @@ class ModBot(discord.Client):
                     reason_text += f" - {report.hate_speech_type.value}"
 
                 # Send report to moderators
-                await self.send_actionable_report_to_mods(
+                moderation_cog = self.get_cog('Moderation')
+                await moderation_cog.send_actionable_report_to_mods(
                     guild_id, 
                     report.message, 
                     message.author,
@@ -190,21 +195,25 @@ class ModBot(discord.Client):
         
         user = await guild.fetch_member(payload.user_id)
         if not user: return
+
+        moderation_cog = self.get_cog('Moderation')
+        if not moderation_cog:
+            return
   
         if payload.message_id in self.mod_reports:
             report_info = self.mod_reports[payload.message_id]
             if payload.emoji.name == '⏫':
-                await self.escalate_report(payload.message_id, report_info, user, guild)
+                await moderation_cog.escalate_report(payload.message_id, report_info, user, guild)
             
             elif payload.emoji.name == '🚔':
-                ref_id = await self.escalate_to_law_enforcement(report_info, user, guild)
+                ref_id = await moderation_cog.escalate_to_law_enforcement(report_info, user, guild)
                 await self.mod_channels[guild.id].send(
                     f"✅ Report escalated to law enforcement by {user.name}\n"
                     f"Reference ID: `{ref_id}`"
                 )
         
         elif payload.emoji.name in ['🚔','✅', '❌']:
-            await self.handle_le_escalation_reaction(payload, user, guild)
+            await moderation_cog.handle_le_escalation_reaction(payload, user, guild)
 
     async def generate_incident_report(self, escalation_record, requesting_user, guild):      
         report_info = escalation_record['original_report']
@@ -261,225 +270,6 @@ class ModBot(discord.Client):
         escalation_record['report_generated_at'] = discord.utils.utcnow()
 
 
-    async def handle_le_escalation_reaction(self, payload, user, guild):   
-        escalation_record = None
-        for ref_id, record in self.law_enforcement_reports.items():
-            if record.get('message_id') == payload.message_id:
-                escalation_record = record
-                break
-        
-        if not escalation_record:
-            return
-        
-        if payload.emoji.name == '🚔':
-            # Law enforcement contacted
-            escalation_record['status'] = 'le_contacted'
-            escalation_record['le_contacted_by'] = user.name
-            escalation_record['le_contacted_at'] = discord.utils.utcnow()
-            
-            await self.mod_channels[guild.id].send(
-                f"✅ **Law enforcement contact confirmed** by {user.name}\n"
-                f"Reference: `{escalation_record['reference_id']}`"
-            )
-        
-        elif payload.emoji.name == '✅':
-            # Mark as resolved
-            escalation_record['status'] = 'resolved'
-            escalation_record['resolved_by'] = user.name
-            escalation_record['resolved_at'] = discord.utils.utcnow()
-            
-            await self.mod_channels[guild.id].send(
-                f"✅ **Law enforcement escalation resolved** by {user.name}\n"
-                f"Reference: `{escalation_record['reference_id']}`"
-            )
-        
-        elif payload.emoji.name == '❌':
-            # Cancel escalation
-            escalation_record['status'] = 'cancelled'
-            escalation_record['cancelled_by'] = user.name
-            escalation_record['cancelled_at'] = discord.utils.utcnow()
-            
-            await self.mod_channels[guild.id].send(
-                f"❌ **Law enforcement escalation cancelled** by {user.name}\n"
-                f"Reference: `{escalation_record['reference_id']}`"
-            )
-
-
-    async def escalate_report(self, original_message_id, report_info, escalated_by, guild):
-        if original_message_id in self.escalated_reports:
-            return
-            
-        self.escalated_reports[original_message_id] = {
-            'escalated_by': escalated_by,
-            'escalated_at': discord.utils.utcnow(),
-            'original_report': report_info
-        }
-        
-        escalation_text = (
-            f"🚨 **ESCALATED REPORT** 🚨\n"
-            f"**Escalated by:** {escalated_by.name}\n"
-            f"**Original reason:** {report_info['reason']}\n"
-            f"**Reported user:** {report_info['reported_message'].author.name}\n"
-            f"**Message content:** \"{report_info['reported_message'].content}\"\n"
-            f"**Report count:** {report_info['report_count']} time(s)\n"
-            f"**Needs senior moderator attention**\n\n"
-            f"Senior moderators can reply with 'Ban', 'Warn', or 'Dismiss' to resolve. React with 🚔 to escalate for law enforcement escalation."
-        )
-        
-        escalation_channel = None
-        
-        for channel in guild.text_channels:
-            if channel.name == f'group-{self.group_num}-escalation':
-                escalation_channel = channel
-                break
-        
-        if not escalation_channel:
-            escalation_channel = self.mod_channels[guild.id]
-            escalation_text = f"@here {escalation_text}"  # Ping everyone for attention
-        
-        escalation_message = await escalation_channel.send(escalation_text)
-        
-        self.mod_reports[escalation_message.id] = report_info.copy()
-        self.mod_reports[escalation_message.id]['is_escalated'] = True
-        self.mod_reports[escalation_message.id]['escalated_by'] = escalated_by.name
-        
-        original_channel = self.mod_channels[guild.id]
-        await original_channel.send(f"✅ Report escalated by {escalated_by.name}")
-
-    async def escalate_to_law_enforcement(self, report_info, escalated_by, guild):
-        reference_id = f"LE-{int(time.time())}-{report_info['reported_message'].id}"
-        
-        escalation_record = {
-            'reference_id': reference_id,
-            'escalated_at': discord.utils.utcnow(),
-            'escalated_by': escalated_by.name,
-            'original_report': report_info,
-            'guild_id': guild.id,
-            'status': 'pending_contact'
-        }
-        
-        self.law_enforcement_reports[reference_id] = escalation_record
-        
-        reported_msg = report_info['reported_message']
-        
-        le_notification = (
-            f"🚨🚔 **LAW ENFORCEMENT ESCALATION** 🚔🚨\n"
-            f"**Reference ID**: `{reference_id}`\n"
-            f"**Escalated by**: {escalated_by.name}\n"
-            f"**Timestamp**: {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
-            
-            f"**INCIDENT DETAILS**:\n"
-            f"• **Reported User**: {reported_msg.author.name} (ID: `{reported_msg.author.id}`)\n"
-            f"• **Message Content**: \"{reported_msg.content}\"\n"
-            f"• **Channel**: #{reported_msg.channel.name}\n"
-            f"• **Server**: {guild.name} (ID: `{guild.id}`)\n"
-            f"• **Original Report**: {report_info['reason']}\n"
-            f"• **Message Timestamp**: {reported_msg.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-            f"• **User Offense History**: {self.user_offense_counts.get(reported_msg.author.id, 0)} previous violations\n\n"
-            
-            f"**NEXT STEPS FOR MODERATORS**:\n"
-            f"1. **Contact local law enforcement** if this involves immediate danger\n"
-            f"2. **Use Discord's Government Request Portal** for non-emergency reports:\n"
-            f"   https://app.kodexglobal.com/discord/signin\n"
-            f"3. **Preserve all evidence** - do not delete the message yet\n"
-            f"4. **Document any additional context** in this channel\n\n"
-            
-            f"**REACTIONS**:\n"
-            f"🚔 - Confirm law enforcement has been contacted\n"
-            f"✅ - Mark as resolved\n"
-            f"❌ - Cancel escalation"
-        )
-        
-        le_message = await self.mod_channels[guild.id].send(le_notification)
-        
-        await le_message.add_reaction('🚔')  # LE contacted
-        await le_message.add_reaction('✅')  # Resolved
-        await le_message.add_reaction('❌')  # Cancel
-        
-        escalation_record['message_id'] = le_message.id
-        
-        return reference_id
-
-    async def send_actionable_report_to_mods(self, guild_id, reported_message, reporter, reason, report_count=1, is_user_report=True):
-        """
-        Sends an actionable report to the mod channel and stores the report info.
-        """
-        if guild_id in self.mod_channels:
-            if is_user_report:
-                reporter_text = f"from {reporter.name} via DM"
-            else:
-                reporter_text = "from automatic detection"
-                
-            mod_message = await self.mod_channels[guild_id].send(
-                f'New report {reporter_text}:\n'
-                f'Reason: {reason}\n'
-                f'Message: {reported_message.author.name}: "{reported_message.content}"\n'
-                f'This message has been reported {report_count} time(s).\n'
-                f'\nModerators can reply with "Ban" or "Warn" to take action.\n'
-                f'React with ⏫ to escalate this report.'
-                f'• React with 🚔 for law enforcement escalation'
-            )
-            
-            await mod_message.add_reaction('⏫')
-            await mod_message.add_reaction('🚔')
-            
-            self.mod_reports[mod_message.id] = {
-                'reported_message': reported_message,
-                'reporter': reporter,
-                'reason': reason,
-                'report_count': report_count,
-                'is_user_report': is_user_report
-            }
-            
-            return mod_message
-        return None
-
-    async def execute_ban(self, reported_user, reported_info, mod_message):
-        """Execute ban action with escalation awareness."""
-        try:
-            await reported_user.send(f"⛔ You have been banned for: {reported_info['reason']}")
-            await reported_info['reported_message'].delete()
-            
-            # Enhanced confirmation for escalated reports
-            if reported_info.get('is_escalated'):
-                await mod_message.channel.send(f"✅ **ESCALATED REPORT RESOLVED** - Ban executed on {reported_user.name} by senior moderator.")
-            else:
-                await mod_message.channel.send(f"✅ Simulated ban message sent to {reported_user.name}.")
-                
-            # Notify reporter
-            if isinstance(reported_info['reporter'], discord.Member):
-                await reported_info['reporter'].send(f"The user you reported has been banned. Thank you for helping keep our community safe!")
-        except discord.Forbidden:
-            await mod_message.channel.send("❌ I couldn't send a message to that user (they may have DMs disabled).")
-
-    async def execute_warn(self, reported_user, reported_info, mod_message):
-        """Execute warn action with escalation awareness."""
-        try:
-            await reported_user.send(f"⚠️ You have received a warning for: {reported_info['reason']}. If this happens again you will be banned.")
-            await reported_info['reported_message'].delete()
-            
-            # Enhanced confirmation for escalated reports
-            if reported_info.get('is_escalated'):
-                await mod_message.channel.send(f"✅ **ESCALATED REPORT RESOLVED** - Warning sent to {reported_user.name} by senior moderator.")
-            else:
-                await mod_message.channel.send(f"✅ Warning sent to {reported_user.name}.")
-                
-            # Notify reporter
-            if isinstance(reported_info['reporter'], discord.Member):
-                await reported_info['reporter'].send(f"The user you reported has been warned. Thank you for helping keep our community safe!")
-        except discord.Forbidden:
-            await mod_message.channel.send("❌ I couldn't send a warning to that user (they may have DMs disabled).")
-
-    async def dismiss_report(self, reported_info, mod_message):
-        """Dismiss an escalated report without action."""
-        await mod_message.channel.send(f"✅ **ESCALATED REPORT DISMISSED** - No action taken after senior review.")
-        
-        # Notify reporter if it was a user report
-        if reported_info.get('is_user_report') and isinstance(reported_info['reporter'], discord.Member):
-            await reported_info['reporter'].send(f"Thank you for your report. After review, no action was deemed necessary, but we appreciate your vigilance in keeping our community safe.")
-
-
-
     async def handle_channel_message(self, message):
         """
         Processes messages in server channels.
@@ -490,36 +280,23 @@ class ModBot(discord.Client):
         if ((message.channel.name == f'group-{self.group_num}-mod' or 
              message.channel.name == f'group-{self.group_num}-escalation') and 
              message.reference):
+            
+            moderation_cog = self.get_cog('Moderation')
+            if not moderation_cog:
+                return
+
             referenced_message = await message.channel.fetch_message(message.reference.message_id)
             if referenced_message.id in self.mod_reports:
                 action = message.content.lower()
                 reported_info = self.mod_reports[referenced_message.id]
                 reported_user = reported_info['reported_message'].author
                 
-                # Handle ban command
                 if action == "ban":
-                    try:
-                        # Simulate banning by sending a DM
-                        await reported_user.send(f"⛔ You have been banned for: {reported_info['reason']}")
-                        await reported_info['reported_message'].delete()
-                        await message.channel.send(f"✅ Simulated ban message sent to {reported_user.name}.")
-                        if isinstance(reported_info['reporter'], discord.Member):
-                            await reported_info['reporter'].send(f"The user you reported has been banned. Thank you for helping keep our community safe!")
-                    except discord.Forbidden:
-                        await message.channel.send("❌ I couldn't send a message to that user (they may have DMs disabled).")
-                
-                # Handle warn command
+                    await moderation_cog.execute_ban(reported_user, reported_info, message)      
                 elif action == "warn":
-                    try:
-                        await reported_user.send(f"⚠️ You have received a warning for: {reported_info['reason']}. If this happens again you will be banned.")
-                        await reported_info['reported_message'].delete()
-                        await message.channel.send(f"✅ Warning sent to {reported_user.name}.")
-                        if isinstance(reported_info['reporter'], discord.Member):
-                            await reported_info['reporter'].send(f"The user you reported has been warned. Thank you for helping keep our community safe!")
-                    except discord.Forbidden:
-                        await message.channel.send("❌ I couldn't send a warning to that user (they may have DMs disabled).")
-                
-                # Handle toggle forwarding command
+                    await moderation_cog.execute_warn(reported_user, reported_info, message)
+                elif action == "dismiss":
+                    await moderation_cog.dismiss_report(reported_info, message)
                 elif action == "toggle forwarding":
                     self.forward_clean_messages = not self.forward_clean_messages
                     status = "enabled" if self.forward_clean_messages else "disabled"
@@ -544,6 +321,8 @@ class ModBot(discord.Client):
             found_hate_speech = found_hate_speech or msg_has_hate
             
             # Forward message analysis to mod channel if appropriate
+            moderation_cog = self.get_cog('Moderation')
+
             if msg_has_hate or self.forward_clean_messages:
                 await mod_channel.send(f'Forwarded message:\n{message.author.name}: "{message.content}"')
                 await mod_channel.send(self.code_format(scores))
@@ -557,7 +336,7 @@ class ModBot(discord.Client):
                 if scores.get("category"):
                     reason_text += f" - {scores.get('category')}"
                 
-                await self.send_actionable_report_to_mods(
+                await moderation_cog.send_actionable_report_to_mods(
                     message.guild.id,
                     message,
                     "AutoMod",
@@ -597,8 +376,9 @@ class ModBot(discord.Client):
                         reason_text = f"Automatic hate speech detection in file ({attachment.filename})"
                         if file_scores.get("category"):
                             reason_text += f" - {file_scores.get('category')}"
-                        
-                        await self.send_actionable_report_to_mods(
+
+                        moderation_cog = self.get_cog('ModerationCog')
+                        await moderation_cog.send_actionable_report_to_mods(
                             message.guild.id,
                             message,
                             "AutoMod", 
