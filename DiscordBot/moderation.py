@@ -19,6 +19,7 @@ class Moderation(commands.Cog):
                 f'Reason: {reason}\n'
                 f'Message: {reported_message.author.name}: "{reported_message.content}"\n'
                 f'This message has been reported {report_count} time(s).\n'
+                f'This user has {self.bot.user_offense_counts.get(reported_message.author.id, 0)} violations.\n'
                 f'\n**Moderation Options:**\n'
                 f'• Reply with "Ban" or "Warn" to take action\n'
                 f'• React with ⏫ for standard escalation\n'
@@ -156,6 +157,8 @@ class Moderation(commands.Cog):
         try:
             await reported_user.send(f"⚠️ You have received a warning for: {reported_info['reason']}. If this happens again you will be banned.")
             await reported_info['reported_message'].delete()
+
+            self.bot.user_offense_counts[reported_user.id] = self.bot.user_offense_counts.get(reported_user.id, 0) + 1
             
             if reported_info.get('is_escalated'):
                 await mod_message.channel.send(f"✅ **ESCALATED REPORT RESOLVED** - Warning sent to {reported_user.name} by senior moderator.")
