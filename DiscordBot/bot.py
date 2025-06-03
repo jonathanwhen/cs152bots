@@ -59,6 +59,8 @@ class ModBot(commands.Bot):
         self.escalated_reports = {}
         self.escalation_channel_id = None
         self.law_enforcement_reports = {}  # Track LE escalations with reference IDs
+
+        self.number_of_false_reports = {}
     
     async def setup_hook(self):
         """Load in moderator flow"""
@@ -290,13 +292,24 @@ class ModBot(commands.Bot):
                 action = message.content.lower()
                 reported_info = self.mod_reports[referenced_message.id]
                 reported_user = reported_info['reported_message'].author
+                reporter = reported_info['reporter']
                 
                 if action == "ban":
                     await moderation_cog.execute_ban(reported_user, reported_info, message)      
                 elif action == "warn":
                     await moderation_cog.execute_warn(reported_user, reported_info, message)
+                elif action == "ban reporter":
+                    if reported_info['is_user_report']:
+                        await moderation_cog.execute_ban_reporter(reporter, reported_info, message)
+                    else:
+                        await message.channel.send("Cannot ban AutoMod reporter.")
+                elif action == "warn reporter":
+                    if reported_info['is_user_report']:
+                        await moderation_cog.execute_warn_reporter(reporter, reported_info, message)
+                    else:
+                        await message.channel.send("Cannot warn AutoMod reporter.")
                 elif action == "dismiss":
-                    await moderation_cog.dismiss_report(reported_info, message)
+                    await moderation_cog.dismiss_report(reporter, reported_info, message)
                 elif action == "toggle forwarding":
                     self.forward_clean_messages = not self.forward_clean_messages
                     status = "enabled" if self.forward_clean_messages else "disabled"
