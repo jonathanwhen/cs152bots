@@ -11,19 +11,32 @@ class Moderation(commands.Cog):
         if guild_id in self.bot.mod_channels:
             if is_user_report:
                 reporter_text = f"from {reporter.name} via DM"
+                reporter_id = reporter.id
             else:
                 reporter_text = "from automatic detection"
+                reporter_id = None
+            
+            reported_user_offenses = self.bot.user_offense_counts.get(reported_message.author.id, 0)
+            reporter_offenses = self.bot.user_offense_counts.get(reporter_id, 0) if reporter_id else 0
+            reporter_mistakes = self.bot.number_of_false_reports.get(reporter_id, 0) if reporter_id else 0
                 
             mod_message = await self.bot.mod_channels[guild_id].send(
                 f'New report {reporter_text}:\n'
                 f'Reason: {reason}\n'
                 f'Message: {reported_message.author.name}: "{reported_message.content}"\n'
-                f'This message has been reported {report_count} time(s).\n'
-                f'This user has {self.bot.user_offense_counts.get(reported_message.author.id, 0)} violations.\n'
+                f'This message has been reported {report_count} time(s).\n\n'
+                f'**Offense counts**:\n'
+                f'• Reported User ({reported_message.author.name}): {reported_user_offenses} offense(s)\n'
+                f'• Reporter ({reporter.name if is_user_report else "AutoMod"}): {reporter_offenses} offense(s)\n'
+                f'• Reporter ({reporter.name if is_user_report else "AutoMod"}): {reporter_mistakes} incorrect reports\n\n'
                 f'\n**Moderation Options:**\n'
-                f'• Reply with "Ban" or "Warn" to take action\n'
+                f'• Reply with "Ban" to ban the reported user\n'
+                f'• Reply with "Warn" to warn the reported user\n'
+                f'• Reply with "Ban Reporter" to ban the reporter\n'
+                f'• Reply with "Warn Reporter" to warn the reporter\n'
                 f'• React with ⏫ for standard escalation\n'
-                f'• React with 🚔 for law enforcement escalation'
+                f'• React with 🚔 for law enforcement escalation\n'
+                f'• Reply with "Dismiss" to dismiss report\n'
             )
             
             await mod_message.add_reaction('⏫')
@@ -60,6 +73,7 @@ class Moderation(commands.Cog):
             f"**Needs senior moderator attention**\n\n"
             f"**Senior Moderator Options:**\n"
             f"• Reply with 'Ban', 'Warn', or 'Dismiss' to resolve\n"
+            f"• Reply with 'Ban Reporter' or 'Warn Reporter' for malicious reporting\n"
             f"• React with 🚔 to escalate to law enforcement"
         )
         
@@ -170,11 +184,42 @@ class Moderation(commands.Cog):
         except discord.Forbidden:
             await mod_message.channel.send("❌ I couldn't send a warning to that user (they may have DMs disabled).")
 
-    async def dismiss_report(self, reported_info, mod_message):
+    async def dismiss_report(self, reporter, reported_info, mod_message):
+        print('here')
         await mod_message.channel.send(f"✅ **ESCALATED REPORT DISMISSED** - No action taken after senior review.")
+        print('here2')
+        self.bot.number_of_false_reports[reporter.id] = self.bot.number_of_false_reports.get(reporter.id, 0) + 1
         
         if reported_info.get('is_user_report') and isinstance(reported_info['reporter'], discord.Member):
             await reported_info['reporter'].send(f"Thank you for your report. After review, no action was deemed necessary, but we appreciate your vigilance in keeping our community safe.")
+    
+
+    async def execute_ban_reporter(self, reporter, reported_info, mod_message):
+        try:
+            await reporter.send(f"⛔ You have been banned for malicious reporting.")
+    
+            if reported_info.get('is_escalated'):
+                await mod_message.channel.send(f"✅ **ESCALATED REPORT RESOLVED** - Ban executed on {reporter.name} by senior moderator.")
+            else:
+                await mod_message.channel.send(f"✅ Simulated ban message sent to {reporter.name}.")
+                
+        except discord.Forbidden:
+            await mod_message.channel.send("❌ I couldn't send a message to that user (they may have DMs disabled).")
+
+    async def execute_warn_reporter(self, reporter, reported_info, mod_message):
+        try:
+            await reporter.send(f"⚠️ You have received a warning for malicious reporting. If this happens again you will be banned.")
+
+            self.bot.user_offense_counts[reporter.id] = self.bot.user_offense_counts.get(reporter.id, 0) + 1
+            
+            if reported_info.get('is_escalated'):
+                await mod_message.channel.send(f"✅ **ESCALATED REPORT RESOLVED** - Warning sent to {reporter.name} by senior moderator.")
+            else:
+                await mod_message.channel.send(f"✅ Warning sent to {reporter.name}.")
+                
+        except discord.Forbidden:
+            await mod_message.channel.send("❌ I couldn't send a warning to that user (they may have DMs disabled).")
+
 
     async def handle_le_escalation_reaction(self, payload, user, guild):
         escalation_record = None
