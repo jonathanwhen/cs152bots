@@ -424,7 +424,7 @@ class ModBot(commands.Bot):
         elif count == 2:
             await mod_channel.send("**Recommended Action**: Issue a final warning to the user.")
 
-    async def call_llm_for_hate_speech(self, text):
+    async def call_llm_for_hate_speech(self, text, example=None):
         """
         Calls an AI language model to evaluate text for hate speech.
         """
@@ -437,8 +437,11 @@ class ModBot(commands.Bot):
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system", "content": "You're a content mod assistant. Analyze the text for hate speech. Respond in JSON with these fields: hate_speech_detected (boolean), confidence_score (number 0-1), category (string or null), explanation (string)."},
-                    {"role": "user", "content": f"Check this text for hate speech: '{text}'"}
+                    # Old prompt
+                    # {"role": "system", "content": "You're a content mod assistant. Analyze the text for hate speech. Respond in JSON with these fields: hate_speech_detected (boolean), confidence_score (number 0-1), category (string or null), explanation (string)."},
+                    # New prompt
+                    {"role": "system", "content": "You're a content mod assistant. Analyze the text for hate speech, specifically threats. Respond in JSON with these fields: hate_speech_detected (boolean), confidence_score (number 0-1), category (string or null), explanation (string)."},
+                    {"role": "user", "content": f"Check this text for hate speech (threats): '{text}'"}
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.1,
@@ -467,7 +470,7 @@ class ModBot(commands.Bot):
                 "hate_speech_detected": False
             }
     
-    async def eval_text(self, message):
+    async def eval_text(self, message, example=None):
         """
         Evaluates text for hate speech.
         """
