@@ -17,7 +17,9 @@ class Moderation(commands.Cog):
                 reporter_id = None
             
             reported_user_offenses = self.bot.user_offense_counts.get(reported_message.author.id, 0)
+            reported_user_suspensions = self.bot.user_suspension_counts.get(reported_message.author.id, 0)
             reporter_offenses = self.bot.user_offense_counts.get(reporter_id, 0) if reporter_id else 0
+            reporter_suspensions = self.bot.user_suspension_counts.get(reporter_id, 0) if reporter_id else 0
             reporter_mistakes = self.bot.number_of_false_reports.get(reporter_id, 0) if reporter_id else 0
                 
             mod_message = await self.bot.mod_channels[guild_id].send(
@@ -26,13 +28,17 @@ class Moderation(commands.Cog):
                 f'Message: {reported_message.author.name}: "{reported_message.content}"\n'
                 f'This message has been reported {report_count} time(s).\n\n'
                 f'**Offense counts**:\n'
-                f'• Reported User ({reported_message.author.name}): {reported_user_offenses} offense(s)\n'
-                f'• Reporter ({reporter.name if is_user_report else "AutoMod"}): {reporter_offenses} offense(s)\n'
+                f'• Reported User ({reported_message.author.name}): {reported_user_suspensions} suspensions(s)\n'
+                f'• Reported User ({reported_message.author.name}): {reported_user_offenses} warning(s)\n\n'
+                f'• Reporter ({reporter.name if is_user_report else "AutoMod"}): {reporter_suspensions} suspension(s)\n'
+                f'• Reporter ({reporter.name if is_user_report else "AutoMod"}): {reporter_offenses} warning(s)\n'
                 f'• Reporter ({reporter.name if is_user_report else "AutoMod"}): {reporter_mistakes} incorrect reports\n\n'
                 f'\n**Moderation Options:**\n'
                 f'• Reply with "Ban" to ban the reported user\n'
+                f'• Reply with "Suspend" to suspend the reported user\n'
                 f'• Reply with "Warn" to warn the reported user\n'
                 f'• Reply with "Ban Reporter" to ban the reporter\n'
+                f'• Reply with "Suspend Reporter" to suspend the reporter\n'
                 f'• Reply with "Warn Reporter" to warn the reporter\n'
                 f'• React with ⏫ for standard escalation\n'
                 f'• React with 🚔 for law enforcement escalation\n'
@@ -166,10 +172,28 @@ class Moderation(commands.Cog):
                 await reported_info['reporter'].send(f"The user you reported has been banned. Thank you for helping keep our community safe!")
         except discord.Forbidden:
             await mod_message.channel.send("❌ I couldn't send a message to that user (they may have DMs disabled).")
+    
+    async def execute_suspend(self, reported_user, reported_info, mod_message):
+        try:
+            await reported_user.send(f"⚠️ You have received a warning for: {reported_info['reason']}. If this happens 3 times you will be banned.")
+            await reported_info['reported_message'].delete()
+
+            self.bot.user_suspension_counts[reported_user.id] = self.bot.user_suspension_counts.get(reported_user.id, 0) + 1
+            
+            if reported_info.get('is_escalated'):
+                await mod_message.channel.send(f"✅ **ESCALATED REPORT RESOLVED** - Warning sent to {reported_user.name} by senior moderator.")
+            else:
+                await mod_message.channel.send(f"✅ Warning sent to {reported_user.name}.")
+                
+            if isinstance(reported_info['reporter'], discord.Member):
+                await reported_info['reporter'].send(f"The user you reported has been warned. Thank you for helping keep our community safe!")
+        except discord.Forbidden:
+            await mod_message.channel.send("❌ I couldn't send a warning to that user (they may have DMs disabled).")
+
 
     async def execute_warn(self, reported_user, reported_info, mod_message):
         try:
-            await reported_user.send(f"⚠️ You have received a warning for: {reported_info['reason']}. If this happens again you will be banned.")
+            await reported_user.send(f"⚠️ You have received a warning for: {reported_info['reason']}. If this happens 3 times you will be suspended.")
             await reported_info['reported_message'].delete()
 
             self.bot.user_offense_counts[reported_user.id] = self.bot.user_offense_counts.get(reported_user.id, 0) + 1
@@ -205,10 +229,24 @@ class Moderation(commands.Cog):
                 
         except discord.Forbidden:
             await mod_message.channel.send("❌ I couldn't send a message to that user (they may have DMs disabled).")
+    
+    async def execute_suspend_reporter(self, reporter, reported_info, mod_message):
+        try:
+            await reporter.send(f"⚠️ You have received a suspension for malicious reporting. If this happens again you will be banned.")
+
+            self.bot.user_suspension_counts[reporter.id] = self.bot.user_suspension_counts.get(reporter.id, 0) + 1
+            
+            if reported_info.get('is_escalated'):
+                await mod_message.channel.send(f"✅ **ESCALATED REPORT RESOLVED** - Warning sent to {reporter.name} by senior moderator.")
+            else:
+                await mod_message.channel.send(f"✅ Warning sent to {reporter.name}.")
+                
+        except discord.Forbidden:
+            await mod_message.channel.send("❌ I couldn't send a warning to that user (they may have DMs disabled).")
 
     async def execute_warn_reporter(self, reporter, reported_info, mod_message):
         try:
-            await reporter.send(f"⚠️ You have received a warning for malicious reporting. If this happens again you will be banned.")
+            await reporter.send(f"⚠️ You have received a warning for malicious reporting. If this happens again you will be suspended.")
 
             self.bot.user_offense_counts[reporter.id] = self.bot.user_offense_counts.get(reporter.id, 0) + 1
             

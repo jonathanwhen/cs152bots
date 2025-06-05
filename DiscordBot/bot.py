@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import requests
-from report import Report, State, ReportReason
+from report import Report, State, ReportReason, SlurType, TargetGroup, Context
 import pdb
 import openai
 import time
@@ -61,6 +61,8 @@ class ModBot(commands.Bot):
         self.law_enforcement_reports = {}  # Track LE escalations with reference IDs
 
         self.number_of_false_reports = {}
+
+        self.user_suspension_counts = {}  # Track total suspensions per user
     
     async def setup_hook(self):
         """Load in moderator flow"""
@@ -156,22 +158,29 @@ class ModBot(commands.Bot):
 
         # Forward complete reports to mod channels
         if author_id in self.reports and self.reports[author_id].state == State.REPORT_COMPLETE and self.reports[author_id].reason:
-            # Find the guild that contains the reported message
             guild_id = self.reports[author_id].message.guild.id
             if guild_id in self.mod_channels:
                 report = self.reports[author_id]
                 reported_message_id = report.message.id
-        
-                # Update the report count for this message
-                if reported_message_id not in self.message_report_counts:
-                    self.message_report_counts[reported_message_id] = 1
-                else:
-                    self.message_report_counts[reported_message_id] += 1
 
-                # Format the reason text with hate speech type if applicable
+                # Update the report count for this message
+                self.message_report_counts[reported_message_id] = self.message_report_counts.get(reported_message_id, 0) + 1
+
+                # Format the reason text with all new details
                 reason_text = report.reason.value
-                if report.reason == ReportReason.HATE_SPEECH and report.hate_speech_type:
-                    reason_text += f" - {report.hate_speech_type.value}"
+                if report.reason == ReportReason.SLURS:
+                    if report.slur_type:
+                        reason_text += f" - {report.slur_type.value}"
+                    if report.target_group:
+                        reason_text += f" (target: {report.target_group.value})"
+                    if report.context:
+                        reason_text += f" [context: {report.context.value}]"
+                
+                if report.additional_context:
+                    reason_text += f"\n\n**Additional Context**: {report.additional_context}"
+                
+                if report.is_immediate_threat:
+                    reason_text = "@here ⚠️ IMMEDIATE THREAT REPORTED ⚠️\n" + reason_text
 
                 # Send report to moderators
                 moderation_cog = self.get_cog('Moderation')
@@ -183,6 +192,7 @@ class ModBot(commands.Bot):
                     self.message_report_counts[reported_message_id],
                     is_user_report=True
                 )
+
 
         # Clean up completed reports
         if author_id in self.reports and self.reports[author_id].report_complete():
@@ -298,11 +308,18 @@ class ModBot(commands.Bot):
                     await moderation_cog.execute_ban(reported_user, reported_info, message)      
                 elif action == "warn":
                     await moderation_cog.execute_warn(reported_user, reported_info, message)
+                elif action == "suspend":
+                    await moderation_cog.execute_suspend(reported_user, reported_info, message)
                 elif action == "ban reporter":
                     if reported_info['is_user_report']:
                         await moderation_cog.execute_ban_reporter(reporter, reported_info, message)
                     else:
                         await message.channel.send("Cannot ban AutoMod reporter.")
+                elif action == "suspend reporter":
+                    if reported_info['is_user_report']:
+                        await moderation_cog.execute_suspend_reporter(reporter, reported_info, message)
+                    else:
+                        await message.channel.send("Cannot suspend AutoMod reporter.")
                 elif action == "warn reporter":
                     if reported_info['is_user_report']:
                         await moderation_cog.execute_warn_reporter(reporter, reported_info, message)
