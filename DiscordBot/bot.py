@@ -6,9 +6,10 @@ import json
 import logging
 import re
 import requests
-from report import Report, State, ReportReason
+from report import Report, State, ReportReason, SlurType, TargetGroup, Context
 import pdb
 import openai
+import time
 from hate_speech_detector import HateSpeechDetector, DetectionMethod
 
 # Set up logging to the console
@@ -37,7 +38,7 @@ with open(token_path) as f:
         print("Add an 'openai' field with your API key to enable hate speech detection")
         openai.api_key = None
 
-class ModBot(discord.Client):
+class ModBot(commands.Bot):
     """
     Discord bot for content moderation with hate speech detection capabilities.
     Handles message reporting, automated content analysis, and moderation actions.
@@ -55,6 +56,18 @@ class ModBot(discord.Client):
         
         # Setting to control whether to forward clean messages (non-flagged) to mod channel
         self.forward_clean_messages = False  # Only forward flagged messages by default
+
+        self.escalated_reports = {}
+        self.escalation_channel_id = None
+        self.law_enforcement_reports = {}  # Track LE escalations with reference IDs
+
+        self.number_of_false_reports = {}
+
+        self.user_suspension_counts = {}  # Track total suspensions per user
+    
+    async def setup_hook(self):
+        """Load in moderator flow"""
+        await self.load_extension('moderation')
 
     async def on_ready(self):
         """
@@ -146,25 +159,33 @@ class ModBot(discord.Client):
 
         # Forward complete reports to mod channels
         if author_id in self.reports and self.reports[author_id].state == State.REPORT_COMPLETE and self.reports[author_id].reason:
-            # Find the guild that contains the reported message
             guild_id = self.reports[author_id].message.guild.id
             if guild_id in self.mod_channels:
                 report = self.reports[author_id]
                 reported_message_id = report.message.id
-        
-                # Update the report count for this message
-                if reported_message_id not in self.message_report_counts:
-                    self.message_report_counts[reported_message_id] = 1
-                else:
-                    self.message_report_counts[reported_message_id] += 1
 
-                # Format the reason text with hate speech type if applicable
+                # Update the report count for this message
+                self.message_report_counts[reported_message_id] = self.message_report_counts.get(reported_message_id, 0) + 1
+
+                # Format the reason text with all new details
                 reason_text = report.reason.value
-                if report.reason == ReportReason.HATE_SPEECH and report.hate_speech_type:
-                    reason_text += f" - {report.hate_speech_type.value}"
+                if report.reason == ReportReason.SLURS:
+                    if report.slur_type:
+                        reason_text += f" - {report.slur_type.value}"
+                    if report.target_group:
+                        reason_text += f" (target: {report.target_group.value})"
+                    if report.context:
+                        reason_text += f" [context: {report.context.value}]"
+                
+                if report.additional_context:
+                    reason_text += f"\n\n**Additional Context**: {report.additional_context}"
+                
+                if report.is_immediate_threat:
+                    reason_text = "@here ⚠️ IMMEDIATE THREAT REPORTED ⚠️\n" + reason_text
 
                 # Send report to moderators
-                await self.send_actionable_report_to_mods(
+                moderation_cog = self.get_cog('Moderation')
+                await moderation_cog.send_actionable_report_to_mods(
                     guild_id, 
                     report.message, 
                     message.author,
@@ -173,49 +194,94 @@ class ModBot(discord.Client):
                     is_user_report=True
                 )
 
+
         # Clean up completed reports
         if author_id in self.reports and self.reports[author_id].report_complete():
             self.reports.pop(author_id)
 
-    async def send_actionable_report_to_mods(self, guild_id, reported_message, reporter, reason, report_count=1, is_user_report=True):
-        """
-        Sends an actionable report to the mod channel and stores the report info.
+    async def on_raw_reaction_add(self, payload):
+        if payload.user_id == self.user.id:
+            return
         
-        Args:
-            guild_id: ID of the guild/server
-            reported_message: The message being reported
-            reporter: User who reported the message or "AutoMod" for automatic detection
-            reason: Reason for the report
-            report_count: Number of times this message has been reported
-            is_user_report: Whether this is a user report (True) or automatic detection (False)
+        guild = self.get_guild(payload.guild_id)
+        if not guild: return
+        
+        user = await guild.fetch_member(payload.user_id)
+        if not user: return
+
+        moderation_cog = self.get_cog('Moderation')
+        if not moderation_cog:
+            return
+  
+        if payload.message_id in self.mod_reports:
+            report_info = self.mod_reports[payload.message_id]
+            if payload.emoji.name == '⏫':
+                await moderation_cog.escalate_report(payload.message_id, report_info, user, guild)
+            
+            elif payload.emoji.name == '🚔':
+                ref_id = await moderation_cog.escalate_to_law_enforcement(report_info, user, guild)
+                await self.mod_channels[guild.id].send(
+                    f"✅ Report escalated to law enforcement by {user.name}\n"
+                    f"Reference ID: `{ref_id}`"
+                )
+        
+        elif payload.emoji.name in ['🚔','✅', '❌']:
+            await moderation_cog.handle_le_escalation_reaction(payload, user, guild)
+
+    async def generate_incident_report(self, escalation_record, requesting_user, guild):      
+        report_info = escalation_record['original_report']
+        reported_msg = report_info['reported_message']
+        
+        incident_report = f"""
+        **INCIDENT REPORT - {escalation_record['reference_id']}**
+        **Generated by**: {requesting_user.name}
+        **Generated at**: {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+        **INCIDENT SUMMARY**:
+        • Reference ID: {escalation_record['reference_id']}
+        • Original Report: {report_info['reason']}
+        • Escalated by: {escalation_record['escalated_by']}
+        • Escalation Time: {escalation_record['escalated_at'].strftime('%Y-%m-%d %H:%M:%S UTC')}
+        • Current Status: {escalation_record['status']}
+
+        **USER INFORMATION**:
+        • Username: {reported_msg.author.name}
+        • User ID: {reported_msg.author.id}
+        • Account Created: {reported_msg.author.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}
+        • Previous Violations: {self.user_offense_counts.get(reported_msg.author.id, 0)}
+
+        **MESSAGE DETAILS**:
+        • Content: "{reported_msg.content}"
+        • Channel: #{reported_msg.channel.name}
+        • Message ID: {reported_msg.id}
+        • Timestamp: {reported_msg.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+        **SERVER INFORMATION**:
+        • Server Name: {guild.name}
+        • Server ID: {guild.id}
+        • Member Count: {guild.member_count}
+
+        **LAW ENFORCEMENT CONTACT INFO**:
+        • Discord Government Request Portal: https://app.kodexglobal.com/discord/signin
+        • For emergencies: Contact local authorities immediately
+        • For non-emergencies: Use the portal above with this Reference ID
+
+        **EVIDENCE PRESERVATION**:
+        • Original message preserved in server
+        • All moderation actions documented
+        • User history tracked in bot database
         """
-        if guild_id in self.mod_channels:
-            # Format reporter information based on source
-            if is_user_report:
-                reporter_text = f"from {reporter.name} via DM"
-            else:
-                reporter_text = "from automatic detection"
-                
-            # Send the report to the mod channel
-            mod_message = await self.mod_channels[guild_id].send(
-                f'New report {reporter_text}:\n'
-                f'Reason: {reason}\n'
-                f'Message: {reported_message.author.name}: "{reported_message.content}"\n'
-                f'This message has been reported {report_count} time(s).\n'
-                f'\nModerators can reply with "Ban" or "Warn" to take action.'
-            )
             
-            # Store the report info for later reference
-            self.mod_reports[mod_message.id] = {
-                'reported_message': reported_message,
-                'reporter': reporter,
-                'reason': reason,
-                'report_count': report_count,
-                'is_user_report': is_user_report
-            }
-            
-            return mod_message
-        return None
+        await self.mod_channels[guild.id].send(
+            f"📋 **INCIDENT REPORT GENERATED**\n"
+            f"``````\n"
+            f"*Copy this report for law enforcement documentation*"
+        )
+        
+        escalation_record['incident_report_generated'] = True
+        escalation_record['report_generated_by'] = requesting_user.name
+        escalation_record['report_generated_at'] = discord.utils.utcnow()
+
 
     async def handle_channel_message(self, message):
         """
@@ -224,14 +290,21 @@ class ModBot(discord.Client):
         and forwards relevant messages to the mod channel.
         """
         # Handle moderator commands (replies to reported messages)
-        if message.channel.name == f'group-{self.group_num}-mod' and message.reference:
+        if ((message.channel.name == f'group-{self.group_num}-mod' or 
+             message.channel.name == f'group-{self.group_num}-escalation') and 
+             message.reference):
+            
+            moderation_cog = self.get_cog('Moderation')
+            if not moderation_cog:
+                return
+
             referenced_message = await message.channel.fetch_message(message.reference.message_id)
             if referenced_message.id in self.mod_reports:
                 action = message.content.lower()
                 reported_info = self.mod_reports[referenced_message.id]
                 reported_user = reported_info['reported_message'].author
+                reporter = reported_info['reporter']
                 
-                # Handle ban command
                 if action == "ban":
                     try:
                         # Simulate banning by sending a DM
@@ -279,6 +352,8 @@ class ModBot(discord.Client):
             found_hate_speech = found_hate_speech or msg_has_hate
             
             # Forward message analysis to mod channel if appropriate
+            moderation_cog = self.get_cog('Moderation')
+
             if msg_has_hate or self.forward_clean_messages:
                 await mod_channel.send(f'Forwarded message:\n{message.author.name}: "{message.content}"')
                 await mod_channel.send(self.code_format(scores))
@@ -292,7 +367,7 @@ class ModBot(discord.Client):
                 if scores.get("category"):
                     reason_text += f" - {scores.get('category')}"
                 
-                await self.send_actionable_report_to_mods(
+                await moderation_cog.send_actionable_report_to_mods(
                     message.guild.id,
                     message,
                     "AutoMod",
@@ -332,8 +407,9 @@ class ModBot(discord.Client):
                         reason_text = f"Automatic hate speech detection in file ({attachment.filename})"
                         if file_scores.get("category"):
                             reason_text += f" - {file_scores.get('category')}"
-                        
-                        await self.send_actionable_report_to_mods(
+
+                        moderation_cog = self.get_cog('ModerationCog')
+                        await moderation_cog.send_actionable_report_to_mods(
                             message.guild.id,
                             message,
                             "AutoMod", 
@@ -379,7 +455,7 @@ class ModBot(discord.Client):
         elif count == 2:
             await mod_channel.send("**Recommended Action**: Issue a final warning to the user.")
 
-    async def call_llm_for_hate_speech(self, text):
+    async def call_llm_for_hate_speech(self, text, example=None):
         """
         Calls an AI language model to evaluate text for hate speech.
         """
@@ -392,8 +468,11 @@ class ModBot(discord.Client):
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system", "content": "You're a content mod assistant. Analyze the text for hate speech. Respond in JSON with these fields: hate_speech_detected (boolean), confidence_score (number 0-1), category (string or null), explanation (string)."},
-                    {"role": "user", "content": f"Check this text for hate speech: '{text}'"}
+                    # Old prompt
+                    # {"role": "system", "content": "You're a content mod assistant. Analyze the text for hate speech. Respond in JSON with these fields: hate_speech_detected (boolean), confidence_score (number 0-1), category (string or null), explanation (string)."},
+                    # New prompt
+                    {"role": "system", "content": "You're a content mod assistant. Analyze the text for hate speech, specifically threats. Respond in JSON with these fields: hate_speech_detected (boolean), confidence_score (number 0-1), category (string or null), explanation (string)."},
+                    {"role": "user", "content": f"Check this text for hate speech (threats): '{text}'"}
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.1,
@@ -422,7 +501,7 @@ class ModBot(discord.Client):
                 "hate_speech_detected": False
             }
     
-    async def eval_text(self, message):
+    async def eval_text(self, message, example=None):
         """
         Evaluates text for hate speech using a two-step process:
         1. First checks for slurs using regex

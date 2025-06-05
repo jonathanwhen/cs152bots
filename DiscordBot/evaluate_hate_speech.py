@@ -8,17 +8,70 @@ from sklearn.metrics import confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 import seaborn as sns
 from bot import ModBot
+from datasets import load_dataset as _load_dataset
 
 # Get the absolute path to the project directory
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Configuration with absolute paths
-DATASET_PATH = os.path.join(PROJECT_DIR, "data", "Stanford Class H.S5 Sub-Sample.csv")
-RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation_results.json")
-SAMPLE_SIZE = None  # Specify number for partial testing (e.g., 20) or None for full dataset
+# DATASET_PATH = os.path.join(PROJECT_DIR, "data", "Stanford Class H.S5 Sub-Sample.csv")
+DATASET_PATH = "google/civil_comments"
+RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cc_evaluation_results.json")
+SAMPLE_SIZE = 200  # Specify number for partial testing (e.g., 20) or None for full dataset
 
 async def load_dataset(path, sample_size=None):
     """Load dataset from CSV and optionally take a sample"""
+
+    # Check if this is a Hugging Face dataset
+    if path == "google/civil_comments":
+        print(f"Loading Hugging Face dataset: {path}")
+        dataset = _load_dataset(path, split="test")
+
+        # Keep only 'threat' and 'text' columns
+        columns_to_keep = ['threat', 'text']
+        available_columns = [col for col in columns_to_keep if col in dataset.column_names]
+        
+        # Select only the available columns we want to keep
+        dataset = dataset.select_columns(available_columns)
+
+        # Filter to sample_size if specified
+        if sample_size is not None and sample_size < len(dataset):
+            # Create balanced sample with equal positive and negative examples
+            positive_indices = [i for i, x in enumerate(dataset) if x['threat'] >= 0.5]
+            negative_indices = [i for i, x in enumerate(dataset) if x['threat'] < 0.5]
+            
+            # Calculate how many of each class to sample
+            samples_per_class = sample_size // 2
+            
+            # Sample equal numbers from each class (or as many as available)
+            pos_sample_size = min(samples_per_class, len(positive_indices))
+            neg_sample_size = min(samples_per_class, len(negative_indices))
+            
+            # If we can't get enough from one class, take more from the other
+            if pos_sample_size < samples_per_class:
+                neg_sample_size = min(sample_size - pos_sample_size, len(negative_indices))
+            elif neg_sample_size < samples_per_class:
+                pos_sample_size = min(sample_size - neg_sample_size, len(positive_indices))
+            
+            # Select the indices
+            selected_pos = positive_indices[:pos_sample_size]
+            selected_neg = negative_indices[:neg_sample_size]
+            selected_indices = selected_pos + selected_neg
+            
+            # Select the balanced sample
+            dataset = dataset.select(selected_indices)
+
+        # Convert threat column to binary labels if it exists
+        if 'threat' in dataset.column_names:
+            dataset = dataset.map(lambda x: {**x, 'label': int(x['threat'] >= 0.5)})
+        
+        # Add content_text column for compatibility
+        dataset = dataset.map(lambda x: {'label': x['label'], 'threat':x['threat'], 'content_text': x['text']})
+
+        df = pd.DataFrame(dataset)
+
+        return df
+
     # Check if file exists
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Dataset file not found at: {path}")
@@ -119,8 +172,10 @@ async def main():
     """Main evaluation process"""
     print("Starting evaluation of hate speech detection...")
     
+    if DATASET_PATH == "google/civil_comments":
+        dataset_path = DATASET_PATH
     # Verify dataset path
-    if not os.path.isfile(DATASET_PATH):
+    elif not os.path.isfile(DATASET_PATH):
         # Try to find the file in common locations
         possible_paths = [
             DATASET_PATH,
