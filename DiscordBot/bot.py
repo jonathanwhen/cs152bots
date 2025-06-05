@@ -9,6 +9,7 @@ import requests
 from report import Report, State, ReportReason
 import pdb
 import openai
+from hate_speech_detector import HateSpeechDetector, DetectionMethod
 
 # Set up logging to the console
 logger = logging.getLogger('discord')
@@ -234,30 +235,30 @@ class ModBot(discord.Client):
                 if action == "ban":
                     try:
                         # Simulate banning by sending a DM
-                        await reported_user.send(f"⛔ You have been banned for: {reported_info['reason']}")
+                        await reported_user.send(f"You have been banned for: {reported_info['reason']}")
                         await reported_info['reported_message'].delete()
-                        await message.channel.send(f"✅ Simulated ban message sent to {reported_user.name}.")
+                        await message.channel.send(f"Simulated ban message sent to {reported_user.name}.")
                         if isinstance(reported_info['reporter'], discord.Member):
                             await reported_info['reporter'].send(f"The user you reported has been banned. Thank you for helping keep our community safe!")
                     except discord.Forbidden:
-                        await message.channel.send("❌ I couldn't send a message to that user (they may have DMs disabled).")
+                        await message.channel.send("I couldn't send a message to that user (they may have DMs disabled).")
                 
                 # Handle warn command
                 elif action == "warn":
                     try:
-                        await reported_user.send(f"⚠️ You have received a warning for: {reported_info['reason']}. If this happens again you will be banned.")
+                        await reported_user.send(f"You have received a warning for: {reported_info['reason']}. If this happens again you will be banned.")
                         await reported_info['reported_message'].delete()
-                        await message.channel.send(f"✅ Warning sent to {reported_user.name}.")
+                        await message.channel.send(f"Warning sent to {reported_user.name}.")
                         if isinstance(reported_info['reporter'], discord.Member):
                             await reported_info['reporter'].send(f"The user you reported has been warned. Thank you for helping keep our community safe!")
                     except discord.Forbidden:
-                        await message.channel.send("❌ I couldn't send a warning to that user (they may have DMs disabled).")
+                        await message.channel.send("I couldn't send a warning to that user (they may have DMs disabled).")
                 
                 # Handle toggle forwarding command
                 elif action == "toggle forwarding":
                     self.forward_clean_messages = not self.forward_clean_messages
                     status = "enabled" if self.forward_clean_messages else "disabled"
-                    await message.channel.send(f"✅ Forwarding of clean messages is now {status}.")
+                    await message.channel.send(f"Forwarding of clean messages is now {status}.")
                 return
 
         # Only process messages from the group's channel
@@ -274,7 +275,7 @@ class ModBot(discord.Client):
             scores = await self.eval_text(message.content)
             
             # Check if hate speech was detected in the message
-            msg_has_hate = scores.get('hate_speech_detected', False)
+            msg_has_hate = scores.get('is_hate_speech', False)
             found_hate_speech = found_hate_speech or msg_has_hate
             
             # Forward message analysis to mod channel if appropriate
@@ -310,7 +311,7 @@ class ModBot(discord.Client):
                     file_scores = await self.eval_text(file_text)
                     
                     # Check if hate speech was detected in the file
-                    file_has_hate = file_scores.get('hate_speech_detected', False)
+                    file_has_hate = file_scores.get('is_hate_speech', False)
                     found_hate_speech = found_hate_speech or file_has_hate
                     
                     # Forward file analysis to mod channel if appropriate
@@ -361,13 +362,13 @@ class ModBot(discord.Client):
         # Format offense count message based on number of offenses
         count = self.user_offense_counts[user.id]
         if count == 1:
-            count_msg = "⚠️ This is their first offense."
+            count_msg = "This is their first offense."
         elif count == 2:
-            count_msg = "⚠️⚠️ This is their second offense."
+            count_msg = "This is their second offense."
         elif count == 3:
-            count_msg = "⚠️⚠️⚠️ This is their third offense. Consider taking stronger action."
+            count_msg = "This is their third offense. Consider taking stronger action."
         else:
-            count_msg = f"⚠️ x{count} This user has {count} total offenses. Immediate action recommended!"
+            count_msg = f"This user has {count} total offenses. Immediate action recommended!"
         
         # Send the offense count to the mod channel
         await mod_channel.send(f"**User Offense Tracking**: {user.name} (ID: {user.id})\n{count_msg}")
@@ -423,10 +424,56 @@ class ModBot(discord.Client):
     
     async def eval_text(self, message):
         """
-        Evaluates text for hate speech.
+        Evaluates text for hate speech using a two-step process:
+        1. First checks for slurs using regex
+        2. If no slurs found, checks with OpenAI API
         """
-        result = await self.call_llm_for_hate_speech(message)
-        return result
+        detector = HateSpeechDetector()
+        
+        # Step 1: Check with regex first
+        regex_results = detector.detect_with_regex_slurs(message)
+        
+        # Convert regex results to dictionary
+        regex_dict = {
+            "method": regex_results.method.value,
+            "is_hate_speech": regex_results.is_hate_speech,
+            "confidence": regex_results.confidence,
+            "category": regex_results.category,
+            "explanation": regex_results.explanation,
+            "detected_terms": regex_results.detected_terms
+        }
+        
+        # If regex found slurs, return those results immediately
+        if regex_results.is_hate_speech:
+            return {
+                "is_hate_speech": True,
+                "confidence": 1.0,  # High confidence for direct slur matches
+                "categories": [regex_results.category] if regex_results.category else ["N/A"],
+                "explanations": [regex_results.explanation] if regex_results.explanation else ["No explanation provided"],
+                "method_results": [regex_dict]
+            }
+            
+        # Step 2: If no slurs found, check with OpenAI API
+        openai_results = await detector.detect_with_openai_api(message)
+        
+        # Convert OpenAI results to dictionary
+        openai_dict = {
+            "method": openai_results.method.value,
+            "is_hate_speech": openai_results.is_hate_speech,
+            "confidence": openai_results.confidence,
+            "category": openai_results.category,
+            "explanation": openai_results.explanation,
+            "detected_terms": openai_results.detected_terms
+        }
+        
+        # Combine results
+        return {
+            "is_hate_speech": openai_results.is_hate_speech,
+            "confidence": openai_results.confidence,
+            "categories": [openai_results.category] if openai_results.category else ["N/A"],
+            "explanations": [openai_results.explanation] if openai_results.explanation else ["No explanation provided"],
+            "method_results": [regex_dict, openai_dict]
+        }
 
     def code_format(self, analysis):
         """
@@ -436,23 +483,43 @@ class ModBot(discord.Client):
             return f"Error: {analysis}"
             
         if "error" in analysis and analysis["error"]:
-            return f"⚠️ Error checking text: {analysis['error']}"
+            return f"Error checking text: {analysis['error']}"
             
-        hate_detected = analysis.get("hate_speech_detected", False)
-        confidence = analysis.get("confidence_score", "N/A")
-        category = analysis.get("category", "N/A")
-        explanation = analysis.get("explanation", "No explanation provided")
+        hate_detected = analysis.get("is_hate_speech", False)
+        confidence = analysis.get("confidence", "N/A")
+        category = analysis.get("categories", ["N/A"])[0] if analysis.get("categories") else "N/A"
+        explanation = analysis.get("explanations", ["No explanation provided"])[0] if analysis.get("explanations") else "No explanation provided"
         
         if hate_detected:
-            status = "🚨 **HATE SPEECH DETECTED**"
+            status = "**HATE SPEECH DETECTED**"
         else:
-            status = "✅ No hate speech detected"
+            status = "No hate speech detected"
             
         formatted = f"{status}\n"
-        formatted += f"**Confidence:** {confidence}\n"
+        formatted += f"**Overall Confidence:** {confidence}\n"
         if category != "N/A" and category is not None:
-            formatted += f"**Category:** {category}\n"
-        formatted += f"**Analysis:** {explanation}"
+            formatted += f"**Overall Category:** {category}\n"
+        formatted += f"**Overall Analysis:** {explanation}\n\n"
+        
+        # Add individual method results
+        formatted += "**Individual Detection Results:**\n"
+        for result in analysis.get("method_results", []):
+            method = result.get("method", "Unknown")
+            method_name = str(method).split(".")[-1].replace("_", " ").title()
+            is_hate = result.get("is_hate_speech", False)
+            conf = result.get("confidence", 0.0)
+            cat = result.get("category", "N/A")
+            exp = result.get("explanation", "No explanation provided")
+            terms = result.get("detected_terms", [])
+            
+            formatted += f"\n**{method_name}:**\n"
+            formatted += f"• Status: {'Detected' if is_hate else 'Not Detected'}\n"
+            formatted += f"• Confidence: {conf:.2f}\n"
+            if cat != "N/A" and cat is not None:
+                formatted += f"• Category: {cat}\n"
+            if terms:
+                formatted += f"• Detected Terms: {', '.join(terms)}\n"
+            formatted += f"• Analysis: {exp}\n"
             
         return formatted
 

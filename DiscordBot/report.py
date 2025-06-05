@@ -29,7 +29,6 @@ class HateSpeechType(Enum):
 
 class HateSpeechClassifier:
     def __init__(self):
-        # Initialize with your API key - ideally from environment variables for security
         openai.api_key = os.environ.get("OPENAI_API_KEY")
     
     async def classify_message(self, message_content):
@@ -39,7 +38,7 @@ class HateSpeechClassifier:
         """
         try:
             response = openai.ChatCompletion.create(
-                model="gpt-4",  # Or use another appropriate model
+                model="gpt-4",  
                 messages=[
                     {"role": "system", "content": "You are an AI trained to detect and classify hate speech in messages."},
                     {"role": "user", "content": f"Analyze this message for hate speech: '{message_content}'. If it contains hate speech, specify the type (hateful references, slurs, hateful symbols/signs, discrimination, or discriminatory stereotypes) and provide a brief explanation. Format your response as: CONTAINS_HATE_SPEECH: [Yes/No], TYPE: [type if applicable], CONFIDENCE: [High/Medium/Low], EXPLANATION: [brief explanation]"}
