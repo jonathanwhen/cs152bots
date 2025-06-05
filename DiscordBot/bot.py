@@ -11,6 +11,7 @@ import pdb
 import openai
 import time
 from hate_speech_detector import HateSpeechDetector, DetectionMethod
+from database import InfractionDatabase
 
 # Set up logging to the console
 logger = logging.getLogger('discord')
@@ -53,6 +54,14 @@ class ModBot(commands.Bot):
         self.mod_reports = {}  # Map from mod message IDs to reported message info
         self.message_report_counts = {}  # Map from message IDs to the number of times they've been reported
         self.user_offense_counts = {}  # Map from user IDs to the number of times they've been flagged for hate speech
+        
+        # Initialize database
+        try:
+            self.db = InfractionDatabase()
+            print("Successfully connected to database")
+        except Exception as e:
+            print(f"Failed to initialize database: {str(e)}")
+            self.db = None
         
         # Setting to control whether to forward clean messages (non-flagged) to mod channel
         self.forward_clean_messages = False  # Only forward flagged messages by default
@@ -345,7 +354,9 @@ class ModBot(commands.Bot):
         
         # Process the text content of the message
         if message.content:
+            print(f"Processing message from {message.author.name}: {message.content}")
             scores = await self.eval_text(message.content)
+            print(f"Evaluation scores: {scores}")
             
             # Check if hate speech was detected in the message
             msg_has_hate = scores.get('is_hate_speech', False)
@@ -355,12 +366,14 @@ class ModBot(commands.Bot):
             moderation_cog = self.get_cog('Moderation')
 
             if msg_has_hate or self.forward_clean_messages:
+                print(f"Hate speech detected: {msg_has_hate}")
                 await mod_channel.send(f'Forwarded message:\n{message.author.name}: "{message.content}"')
                 await mod_channel.send(self.code_format(scores))
             
             # Update user offense count and create actionable report if hate speech was detected
             if msg_has_hate:
-                await self.update_user_offense_count(message.author, mod_channel)
+                print(f"Updating offense count for {message.author.name}")
+                await self.update_user_offense_count(message.author, mod_channel, message)
                 
                 # Create an actionable report for moderators
                 reason_text = f"Automatic hate speech detection"
@@ -401,13 +414,13 @@ class ModBot(commands.Bot):
                     
                     # Update user offense count and create actionable report if hate speech was detected
                     if file_has_hate:
-                        await self.update_user_offense_count(message.author, mod_channel)
+                        await self.update_user_offense_count(message.author, mod_channel, message)
                         
                         # Create an actionable report for moderators for file content
                         reason_text = f"Automatic hate speech detection in file ({attachment.filename})"
                         if file_scores.get("category"):
                             reason_text += f" - {file_scores.get('category')}"
-
+                        
                         moderation_cog = self.get_cog('ModerationCog')
                         await moderation_cog.send_actionable_report_to_mods(
                             message.guild.id,
@@ -424,36 +437,75 @@ class ModBot(commands.Bot):
         if found_hate_speech and not message.content and not any(a.filename.lower().endswith('.txt') for a in message.attachments):
             await mod_channel.send(f'⚠️ Hate speech detected in message from {message.author.name} but no content to display.')
 
-    async def update_user_offense_count(self, user, mod_channel):
+    async def update_user_offense_count(self, user, mod_channel, original_message=None):
         """
         Updates and reports a user's offense count for hate speech.
+        Also records the infraction in the database.
+        
+        Args:
+            user: The user who committed the offense
+            mod_channel: The moderation channel to send reports to
+            original_message: The message that triggered the infraction (optional)
         """
-        # Initialize count if this is the first offense
-        if user.id not in self.user_offense_counts:
-            self.user_offense_counts[user.id] = 0
-            
-        # Increment the offense count
-        self.user_offense_counts[user.id] += 1
+        print(f"Starting update_user_offense_count for {user.name}")
         
-        # Format offense count message based on number of offenses
-        count = self.user_offense_counts[user.id]
-        if count == 1:
-            count_msg = "This is their first offense."
-        elif count == 2:
-            count_msg = "This is their second offense."
-        elif count == 3:
-            count_msg = "This is their third offense. Consider taking stronger action."
+        # Record the infraction in the database if available
+        if self.db:
+            try:
+                print(f"Database available, attempting to record infraction for {user.name}")
+                
+                # Use the original message if provided, otherwise try to find it
+                message = original_message
+                if not message:
+                    async for msg in mod_channel.history(limit=100):
+                        if msg.author.id == user.id:
+                            message = msg
+                            break
+                
+                if message:
+                    print(f"Found message: {message.content}")
+                    result = await self.db.add_infraction(
+                        user_id=user.id,
+                        user_name=user.name,
+                        infraction_type="hate_speech",
+                        reason="Automated detection",
+                        message_content=message.content,
+                        channel_id=message.channel.id,
+                        message_id=message.id,
+                        guild_id=message.guild.id,
+                        detected_by="automod",
+                        confidence=1.0,  # High confidence for direct detection
+                        category="hate_speech"
+                    )
+                    print(f"Database operation result: {result}")
+                    
+                    # Get the updated count from the database
+                    count = await self.db.get_user_infraction_count(user.id, message.guild.id)
+                    
+                    # Format offense count message based on number of offenses
+                    if count == 1:
+                        count_msg = "This is their first offense."
+                    elif count == 2:
+                        count_msg = "This is their second offense."
+                    elif count == 3:
+                        count_msg = "This is their third offense. Consider taking stronger action."
+                    else:
+                        count_msg = f"This user has {count} total offenses. Immediate action recommended!"
+                    
+                    # Send the offense count to the mod channel
+                    await mod_channel.send(f"**User Offense Tracking**: {user.name} (ID: {user.id})\n{count_msg}")
+                    
+                    # Recommend action based on offense count
+                    if count >= 3:
+                        await mod_channel.send("**Recommended Action**: Ban user for repeated hate speech violations.")
+                    elif count == 2:
+                        await mod_channel.send("**Recommended Action**: Issue a final warning to the user.")
+                else:
+                    print("Could not find the original message - skipping database recording")
+            except Exception as e:
+                print(f"Failed to record infraction in database: {str(e)}", exc_info=True)
         else:
-            count_msg = f"This user has {count} total offenses. Immediate action recommended!"
-        
-        # Send the offense count to the mod channel
-        await mod_channel.send(f"**User Offense Tracking**: {user.name} (ID: {user.id})\n{count_msg}")
-        
-        # Recommend action based on offense count
-        if count >= 3:
-            await mod_channel.send("**Recommended Action**: Ban user for repeated hate speech violations.")
-        elif count == 2:
-            await mod_channel.send("**Recommended Action**: Issue a final warning to the user.")
+            print("Database not initialized - skipping infraction recording")
 
     async def call_llm_for_hate_speech(self, text, example=None):
         """
