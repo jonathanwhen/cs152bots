@@ -15,30 +15,123 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Configuration with absolute paths
 # DATASET_PATH = os.path.join(PROJECT_DIR, "data", "Stanford Class H.S5 Sub-Sample.csv")
-DATASET_PATH = "google/civil_comments"
+# DATASET_PATH = "google/civil_comments"
+DATASET_PATH = "ucberkeley-dlab/measuring-hate-speech"
 RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cc_evaluation_results.json")
 SAMPLE_SIZE = 200  # Specify number for partial testing (e.g., 20) or None for full dataset
+
+def contains_slur(text):
+    """
+    Check if text contains slurs using the HurtLex lexicon.
+    Returns True if slurs are detected, False otherwise.
+    """
+    try:
+        import requests
+        import os
+        import re
+        
+        # Path to store the HurtLex lexicon locally
+        hurtlex_path = os.path.join(os.path.dirname(__file__), "hurtlex_EN.tsv")
+        
+        # Download HurtLex if not already present
+        if not os.path.exists(hurtlex_path):
+            print("Downloading HurtLex lexicon...")
+            url = "https://raw.githubusercontent.com/valeriobasile/hurtlex/master/lexica/EN/1.2/hurtlex_EN.tsv"
+            response = requests.get(url)
+            if response.status_code == 200:
+                with open(hurtlex_path, 'w', encoding='utf-8') as f:
+                    f.write(response.text)
+                print("HurtLex lexicon downloaded successfully.")
+            else:
+                print("Failed to download HurtLex lexicon.")
+                return False
+        
+        # Load HurtLex terms if not already loaded
+        if not hasattr(contains_slur, '_hurtlex_terms'):
+            hurtlex_terms = set()
+            try:
+                with open(hurtlex_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 5:  # Ensure we have enough columns
+                            category = parts[2]  # The category column (3rd column, 0-indexed)
+                            if category == 'ps' and parts[5] == "conservative":  # Only load terms with PS category
+                                term = parts[4].lower()  # The lemma column (5th column, 0-indexed)
+                                hurtlex_terms.add(term)
+                contains_slur._hurtlex_terms = hurtlex_terms
+                print(f"Loaded {len(hurtlex_terms)} PS category terms from HurtLex lexicon.")
+            except Exception as e:
+                print(f"Error loading HurtLex lexicon: {e}")
+                return False
+        
+        # Check if text contains any HurtLex terms
+        text_lower = text.lower()
+        # words = re.findall(r'\b\w+\b', text_lower)
+        
+        # for word in words:
+        #     if word in contains_slur._hurtlex_terms:
+        #         return True
+
+        for term in contains_slur._hurtlex_terms:
+            if term in text_lower:
+                return True
+        
+        return False
+    
+    except ImportError:
+        print("Warning: requests library not installed. Install with: pip install requests")
+        return False
+    except Exception as e:
+        print(f"Error checking for slurs: {e}")
+        return False
+
 
 async def load_dataset(path, sample_size=None):
     """Load dataset from CSV and optionally take a sample"""
 
     # Check if this is a Hugging Face dataset
-    if path == "google/civil_comments":
+    if path == "ucberkeley-dlab/measuring-hate-speech":
         print(f"Loading Hugging Face dataset: {path}")
-        dataset = _load_dataset(path, split="test")
+        dataset = _load_dataset(path, split="train")
 
         # Keep only 'threat' and 'text' columns
-        columns_to_keep = ['threat', 'text']
+        columns_to_keep = ['text']
         available_columns = [col for col in columns_to_keep if col in dataset.column_names]
         
         # Select only the available columns we want to keep
         dataset = dataset.select_columns(available_columns)
+        # Add slur detection label
+        print("Adding slur detection labels...")
+        dataset = dataset.map(lambda x: {**x, 'contains_slur': contains_slur(x['text'])})
+
+        # Print statistics about slur detection
+        total_samples = len(dataset)
+        slur_count = sum(1 for x in dataset if x['contains_slur'] == True)
+        non_slur_count = total_samples - slur_count
+        
+        print(f"Dataset statistics:")
+        print(f"  Total samples: {total_samples}")
+        print(f"  Contains slur: {slur_count}")
+        print(f"  No slur: {non_slur_count}")
+        print(f"  Slur percentage: {slur_count/total_samples*100:.1f}%")
+
+        # Print examples of texts with slurs
+        print("\nExamples of texts containing slurs:")
+        slur_examples = [x['text'] for x in dataset if x['contains_slur'] == True][:5]
+        for i, example in enumerate(slur_examples, 1):
+            print(f"  Example {i}: {example}")
+
+        # Print examples of texts without slurs
+        print("\nExamples of texts without slurs:")
+        non_slur_examples = [x['text'] for x in dataset if x['contains_slur'] == False][:5]
+        for i, example in enumerate(non_slur_examples, 1):
+            print(f"  Example {i}: {example}")
 
         # Filter to sample_size if specified
         if sample_size is not None and sample_size < len(dataset):
             # Create balanced sample with equal positive and negative examples
-            positive_indices = [i for i, x in enumerate(dataset) if x['threat'] >= 0.5]
-            negative_indices = [i for i, x in enumerate(dataset) if x['threat'] < 0.5]
+            positive_indices = [i for i, x in enumerate(dataset) if x['contains_slur'] == True]
+            negative_indices = [i for i, x in enumerate(dataset) if x['contains_slur'] == False]
             
             # Calculate how many of each class to sample
             samples_per_class = sample_size // 2
@@ -62,11 +155,11 @@ async def load_dataset(path, sample_size=None):
             dataset = dataset.select(selected_indices)
 
         # Convert threat column to binary labels if it exists
-        if 'threat' in dataset.column_names:
-            dataset = dataset.map(lambda x: {**x, 'label': int(x['threat'] >= 0.5)})
+        if 'contains_slur' in dataset.column_names:
+            dataset = dataset.map(lambda x: {**x, 'label': int(x['contains_slur'] == True)})
         
         # Add content_text column for compatibility
-        dataset = dataset.map(lambda x: {'label': x['label'], 'threat':x['threat'], 'content_text': x['text']})
+        dataset = dataset.map(lambda x: {'label': x['label'], 'contains_slur':x['contains_slur'], 'content_text': x['text']})
 
         df = pd.DataFrame(dataset)
 
@@ -101,7 +194,7 @@ async def evaluate_detection(bot, dataset):
         prediction = await bot.eval_text(cleaned_text)
         
         # Check if hate speech was detected
-        is_hate_speech = prediction.get('hate_speech_detected', False)
+        is_hate_speech = prediction.get('is_hate_speech', False)
         
         # Store results
         results.append({
@@ -151,11 +244,11 @@ def create_confusion_matrix(true_labels, predicted_labels):
     # Create and save visualization
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Not Hate Speech', 'Hate Speech'],
-                yticklabels=['Not Hate Speech', 'Hate Speech'])
+                xticklabels=['No Slur', 'Slur'],
+                yticklabels=['No Slur', 'Slur'])
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
-    plt.title('Hate Speech Detection Confusion Matrix')
+    plt.title('Slur Detection Confusion Matrix')
     plt.tight_layout()
     plt.savefig('confusion_matrix.png')
     print("Confusion matrix visualization saved as 'confusion_matrix.png'")
@@ -172,7 +265,7 @@ async def main():
     """Main evaluation process"""
     print("Starting evaluation of hate speech detection...")
     
-    if DATASET_PATH == "google/civil_comments":
+    if DATASET_PATH == "ucberkeley-dlab/measuring-hate-speech":
         dataset_path = DATASET_PATH
     # Verify dataset path
     elif not os.path.isfile(DATASET_PATH):
@@ -225,12 +318,12 @@ async def main():
         print("\nSample False Positives (Non-hate speech classified as hate speech):")
         false_positives = [r for r in results if r['true_label'] == 0 and r['predicted'] == 1]
         for i, fp in enumerate(false_positives[:5]):  # Show first 5
-            print(f"{i+1}. \"{fp['text'][:100]}...\" - Explanation: {fp['explanation'][:100]}...")
+            print(f"{i+1}. \"{fp['text']}\" - Explanation: {fp['explanation'][:100]}...")
         
         print("\nSample False Negatives (Hate speech not detected):")
         false_negatives = [r for r in results if r['true_label'] == 1 and r['predicted'] == 0]
         for i, fn in enumerate(false_negatives[:5]):  # Show first 5
-            print(f"{i+1}. \"{fn['text'][:100]}...\" - Explanation: {fn['explanation'][:100]}...")
+            print(f"{i+1}. \"{fn['text']}\" - Explanation: {fn['explanation'][:100]}...")
     
     except Exception as e:
         print(f"Error during evaluation: {str(e)}")
