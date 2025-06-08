@@ -1,19 +1,32 @@
 # CS 152 - Trust and Safety Engineering
 
+Link for poster: [https://docs.google.com/presentation/d/1ELpXakR6asJ1mv32tgSdWLMxnivZmqLT/edit?usp=sharing&ouid=100813567825622259632&rtpof=true&sd=true](https://docs.google.com/presentation/d/1ELpXakR6asJ1mv32tgSdWLMxnivZmqLT/edit?usp=sharing&ouid=100813567825622259632&rtpof=true&sd=true)
+
 Link the demo video used for presentation can be found here: https://drive.google.com/file/d/1ntUUyr7FKFRo3bhFw0H4ttBkq4kcelKW/view
 
 Note: We intentionally made the video shorter for the sake of the presentation. More details about our technical implementation can be found in this doc. 
 
 # Technical Backend
 
-## Regex
+## Automatic Detection
 
-## OpenAI call with prompting
+Our automatic detection system uses a two-step "sieve" method. The first step is comrpised of regex string matching. The second step uses LLM classification.
+
+### Regex
+
+In the first step, we use regex string matching between an offline dataset of slurs and the input text. If a match is identified, the text is automatically forwarded to moderator interface for review. If nothing is found, the string is passed to an LLM evaluator.
+
+### OpenAI call with prompting
+
+The LLLM evaluator uses an OpenAI endpoint to evaluate the text contents. We experiment with a variety of prompts, ranging from broadly addresssing hate speech to addressing slurs in particular. Ultimately, we discover that more task specific prompts work the best. If a match is identified, the sting is flagged for moderator review. Otherwise, it is cleared from the automatic classification pipeline.
+
+## Discussion
 
 ### Eval for just OpenAI call
 
 #### Utilizing dataset from class (startup) \\
 
+```
 Confusion Matrix:
                | Predicted No | Predicted Yes
 True No        | 68 (TN)     | 55 (FP)
@@ -35,10 +48,11 @@ Not Hate Speech       0.92      0.55      0.69       123
        accuracy                           0.69       200
       macro avg       0.74      0.74      0.69       200
    weighted avg       0.78      0.69      0.69       200
-
+```
 
 #### Utilizing Civil Comments Dataset (with specific prompting)
 
+```
 Confusion Matrix:
                | Predicted No | Predicted Yes
 True No        | 95 (TN)     | 5 (FP)
@@ -60,9 +74,11 @@ Not Hate Speech       0.72      0.95      0.82       100
        accuracy                           0.79       200
       macro avg       0.82      0.79      0.78       200
    weighted avg       0.82      0.79      0.78       200
+```
 
 #### Utilizing Civil Comments Dataset (without specific prompting)
 
+```
 Confusion Matrix:
                | Predicted No | Predicted Yes
 True No        | 93 (TN)     | 7 (FP)
@@ -84,12 +100,13 @@ Not Hate Speech       0.67      0.93      0.78       100
        accuracy                           0.73       200
       macro avg       0.78      0.74      0.72       200
    weighted avg       0.78      0.73      0.72       200
+```
 
 ### Supabase
 
 Our moderator bot maintains an internal database for tracking report history. The database is built using Supabase, an abstraction layer on PostgreSQL. We chose to use this database for its simplicity and reliability.
 When a user’s message is reported, our bot queries the database for past reports regarding this user. It provides this as context to the moderator. As seen in the moderator flow diagram, part of the message sent to the moderator contains “User Offense History.” The more reports a user has had filed against them, the stronger the model suggests that the moderator take action.  
 
-### Eval for everything
+### Eval for Complete Pipeline
 
 Can be found in poster. An improvement that can be made to our final setup is that instead of making an openai call if there is no match, instead we only make an openai call if there is a match to evaluation for context. However, this requires us to include misspelled words in our regex dataset which we would theoretically need to create overtime as more mispellings of slurs arise.
